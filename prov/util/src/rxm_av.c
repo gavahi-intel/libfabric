@@ -30,6 +30,8 @@
  * SOFTWARE.
  */
 
+#include <inttypes.h>
+
 #include "ofi_util.h"
 #include "uthash.h"
 
@@ -121,6 +123,8 @@ struct util_peer_addr *util_get_peer(struct rxm_av *av, const void *addr,
 	if (peer)
 		peer->firewall_addr |= !!(flags & FI_FIREWALL_ADDR);
 
+
+
 	ofi_genlock_unlock(&av->util_av.lock);
 	return peer;
 }
@@ -191,6 +195,7 @@ static int rxm_av_add_peers(struct rxm_av *av, const void *addr, size_t count,
 			peer->fi_addr = user_ids[i];
 		else
 			peer->fi_addr = cur_fi_addr;
+
 
 		/* lookup can fail if prior AV insertion failed */
 		if (peer->fi_addr != FI_ADDR_NOTAVAIL)
@@ -287,13 +292,26 @@ static int rxm_av_remove(struct fid_av *av_fid, fi_addr_t *fi_addr,
 	return ret;
 }
 
+void rxm_av_foreach_ep(struct util_av *av)
+{
+	struct dlist_entry *av_entry;
+	struct util_ep *util_ep;
+	struct rxm_av *rxm_av = container_of(av, struct rxm_av, util_av);
+
+	if (!rxm_av->foreach_ep)
+		return;
+
+	dlist_foreach (&av->ep_list, av_entry) {
+		util_ep = container_of(av_entry, struct util_ep, av_entry);
+		rxm_av->foreach_ep(av, util_ep);
+	}
+}
+
 static int rxm_av_insert(struct fid_av *av_fid, const void *addr, size_t count,
 			 fi_addr_t *fi_addr, uint64_t flags, void *context)
 {
 	struct rxm_av *av;
 	fi_addr_t *user_ids = NULL;
-	struct dlist_entry *av_entry;
-	struct util_ep *util_ep;
 	int ret;
 
 	if (flags & FI_AV_USER_ID) {
@@ -316,13 +334,7 @@ static int rxm_av_insert(struct fid_av *av_fid, const void *addr, size_t count,
 		goto out;
 	}
 
-	if (!av->foreach_ep)
-		goto out;
-
-	dlist_foreach (&av->util_av.ep_list, av_entry) {
-		util_ep = container_of(av_entry, struct util_ep, av_entry);
-		av->foreach_ep(&av->util_av, util_ep);
-	}
+	rxm_av_foreach_ep(&av->util_av);
 
 out:
 	free(user_ids);

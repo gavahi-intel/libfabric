@@ -971,6 +971,7 @@ int rxm_util_av_open(struct fid_domain *domain_fid, struct fi_av_attr *attr,
 		     void (*foreach_ep)(struct util_av *av,
 					struct util_ep *ep));
 size_t rxm_av_max_peers(struct rxm_av *av);
+void rxm_av_foreach_ep(struct util_av *av);
 void rxm_ref_peer(struct util_peer_addr *peer);
 void *rxm_av_alloc_conn(struct rxm_av *av);
 void rxm_av_free_conn(struct rxm_av *av, void *conn_ctx);

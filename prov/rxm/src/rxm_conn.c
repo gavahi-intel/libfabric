@@ -645,8 +645,10 @@ rxm_process_connreq(struct rxm_ep *ep, struct rxm_eq_cm_entry *cm_entry)
 {
 	union ofi_sock_ip peer_addr;
 	struct util_peer_addr *peer;
+	struct util_peer_addr **peer_ctx;
 	struct rxm_conn *conn;
 	struct rxm_av *av;
+	fi_addr_t fi_addr;
 	ssize_t ret;
 	int cmp;
 
@@ -665,9 +667,26 @@ rxm_process_connreq(struct rxm_ep *ep, struct rxm_eq_cm_entry *cm_entry)
 		goto reject;
 	}
 
+	if (peer->fi_addr == FI_ADDR_NOTAVAIL) {
+		fi_addr = ofi_av_lookup_fi_addr(&av->util_av, &peer_addr);
+		if (fi_addr != FI_ADDR_NOTAVAIL) {
+			ofi_genlock_lock(&av->util_av.lock);
+			peer->fi_addr = fi_addr;
+			peer_ctx = ofi_av_addr_context(&av->util_av, fi_addr);
+			if (!*peer_ctx)
+				*peer_ctx = peer;
+			ofi_genlock_unlock(&av->util_av.lock);
+		}
+	}
+
 	conn = rxm_add_conn(ep, peer);
 	if (!conn)
 		goto remove;
+
+	/* Register newly allocated peer with all endpoints' receive contexts
+	 * so that directed receives can find the correct peer->fi_addr mapping.
+	 */
+	rxm_av_foreach_ep(&av->util_av);
 
 	FI_INFO(&rxm_prov, FI_LOG_EP_CTRL, "connreq for %p\n", conn);
 	switch (conn->state) {
