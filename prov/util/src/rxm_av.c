@@ -253,18 +253,8 @@ static int rxm_av_remove(struct fid_av *av_fid, fi_addr_t *fi_addr,
 			continue;
 		}
 
-		av_entry = ofi_bufpool_get_ibuf(av->util_av.av_entry_pool,
-						fi_addr[i]);
 		if (av->util_av.remove_handler) {
-			/* The remove_handler may call back into the AV to
-			 * remove the provider's reference on the peer address.
-			 * We need to drop the lock on the AV in case the
-			 * handler tries to acquire it, plus to avoid nesting
-			 * the ep_list_lock under the AV lock.  Increment
-			 * the reference count on the peer, so that it's still
-			 * valid to pass into the handler and isn't freed by
-			 * another thread after we drop the AV lock.
-			 */
+			/* bump refcnt so peer survives the AV lock drop */
 			peer = ofi_av_addr_context(&av->util_av, fi_addr[i]);
 			(*peer)->refcnt++;
 			ofi_genlock_unlock(&av->util_av.lock);
@@ -281,6 +271,8 @@ static int rxm_av_remove(struct fid_av *av_fid, fi_addr_t *fi_addr,
 			util_deref_peer(*peer);
 		}
 
+		av_entry = ofi_bufpool_get_ibuf(av->util_av.av_entry_pool,
+						fi_addr[i]);
 		if (!ofi_atomic_dec32(&av_entry->use_cnt)) {
 			rxm_put_peer_addr(av, fi_addr[i]);
 			HASH_DELETE(hh, av->util_av.hash, av_entry);
@@ -301,10 +293,12 @@ void rxm_av_foreach_ep(struct util_av *av)
 	if (!rxm_av->foreach_ep)
 		return;
 
+	ofi_genlock_lock(&av->ep_list_lock);
 	dlist_foreach (&av->ep_list, av_entry) {
 		util_ep = container_of(av_entry, struct util_ep, av_entry);
 		rxm_av->foreach_ep(av, util_ep);
 	}
+	ofi_genlock_unlock(&av->ep_list_lock);
 }
 
 static int rxm_av_insert(struct fid_av *av_fid, const void *addr, size_t count,

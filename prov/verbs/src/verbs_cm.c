@@ -246,6 +246,7 @@ vrb_msg_ep_accept(struct fid_ep *ep, const void *param, size_t paramlen)
 
 	cm_hdr = alloca(sizeof(*cm_hdr) + paramlen);
 	vrb_msg_ep_prepare_cm_data(param, paramlen, cm_hdr);
+	memset(&conn_param, 0, sizeof(conn_param));
 	vrb_ep_prepare_rdma_cm_param(&conn_param, cm_hdr,
 					sizeof(*cm_hdr) + paramlen);
 

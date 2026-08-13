@@ -235,13 +235,17 @@ static void rxm_foreach_ep(struct util_av *av, struct util_ep *ep)
 {
 	struct rxm_ep *rxm_ep;
 	struct fid_peer_srx *peer_srx;
+	int lock_held;
 
 	rxm_ep = container_of(ep, struct rxm_ep, util_ep);
 	peer_srx = container_of(rxm_ep->srx, struct fid_peer_srx, ep_fid);
 	if (peer_srx) {
-		ofi_genlock_lock(&rxm_ep->util_ep.lock);
+		lock_held = ofi_genlock_held(&rxm_ep->util_ep.lock);
+		if (!lock_held)
+			ofi_genlock_lock(&rxm_ep->util_ep.lock);
 		peer_srx->owner_ops->foreach_unspec_addr(peer_srx, &rxm_get_addr);
-		ofi_genlock_unlock(&rxm_ep->util_ep.lock);
+		if (!lock_held)
+			ofi_genlock_unlock(&rxm_ep->util_ep.lock);
 	}
 }
 
