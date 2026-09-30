@@ -459,6 +459,8 @@ struct fi_ops_srx_owner {
                   fi_addr_t (*get_addr)(struct fi_peer_rx_entry *));
 
     void (*free_entry)(struct fi_peer_rx_entry *entry);
+    void (*flush_unspec_for_addr)(struct fid_peer_srx *srx, fi_addr_t addr,
+                  fi_addr_t (*get_addr)(struct fi_peer_rx_entry *));
 };
 
 struct fi_ops_srx_peer {
@@ -486,8 +488,9 @@ to those defined for peer CQs, relative to owner versus peer ops.
 The owner is responsible for acquiring any necessary locks before anything that
 could result in peer callbacks.
 The following functions are progress level functions:
-get_msg(), get_tag(), queue_msg(), queue_tag(), free_entry(), start_msg(),
-start_tag(), discard_msg(), discard_tag(). If needed, it is the owner's
+get_msg(), get_tag(), queue_msg(), queue_tag(), free_entry(),
+flush_unspec_for_addr(), start_msg(), start_tag(), discard_msg(),
+discard_tag(). If needed, it is the owner's
 responsibility to acquire the appropriate lock prior to calling into a peer's
 fi_cq_read(), or similar, function that drives progress.
 
@@ -553,6 +556,19 @@ Called by the peer when any addressing updates have occurred with the peer. This
 triggers the owner to iterate over any entries whose address is still unknown
 and call the inputed get_addr function on each to retrieve updated address
 information.
+
+## fi_ops_srx_owner::flush_unspec_for_addr()
+
+Called by the peer before it passes a known addr to get_msg() or get_tag(),
+if it may have queued unexpected messages from that source while its address
+was still unknown. The owner calls the inputed get_addr function on its
+entries of unknown address that were queued by this peer and makes every
+entry that resolves to addr available to receives directed at addr, ahead of
+the message about to be matched and in the order the entries were queued.
+Without this, the new message could be matched before older messages from
+the same source that have not been updated by foreach_unspec_addr() yet.
+Optional; an owner that keeps entries of unknown address ordered with those
+of known address can leave it NULL.
 
 # fi_ops_srx_owner:: free_entry()
 

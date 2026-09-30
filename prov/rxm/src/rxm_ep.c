@@ -1694,6 +1694,7 @@ int rxm_endpoint(struct fid_domain *domain, struct fi_info *info,
 	rxm_ep = calloc(1, sizeof(*rxm_ep));
 	if (!rxm_ep)
 		return -FI_ENOMEM;
+	ofi_atomic_initialize32(&rxm_ep->unspec_migrate, 0);
 
 	rxm_ep->rxm_info = fi_dupinfo(info);
 	if (!rxm_ep->rxm_info) {

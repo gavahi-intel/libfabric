@@ -287,13 +287,25 @@ static int rxm_av_remove(struct fid_av *av_fid, fi_addr_t *fi_addr,
 	return ret;
 }
 
+static void rxm_av_foreach_ep(struct rxm_av *av)
+{
+	struct dlist_entry *av_entry;
+	struct util_ep *util_ep;
+
+	if (!av->foreach_ep)
+		return;
+
+	dlist_foreach (&av->util_av.ep_list, av_entry) {
+		util_ep = container_of(av_entry, struct util_ep, av_entry);
+		av->foreach_ep(&av->util_av, util_ep);
+	}
+}
+
 static int rxm_av_insert(struct fid_av *av_fid, const void *addr, size_t count,
 			 fi_addr_t *fi_addr, uint64_t flags, void *context)
 {
 	struct rxm_av *av;
 	fi_addr_t *user_ids = NULL;
-	struct dlist_entry *av_entry;
-	struct util_ep *util_ep;
 	int ret;
 
 	if (flags & FI_AV_USER_ID) {
@@ -316,14 +328,7 @@ static int rxm_av_insert(struct fid_av *av_fid, const void *addr, size_t count,
 		goto out;
 	}
 
-	if (!av->foreach_ep)
-		goto out;
-
-	dlist_foreach (&av->util_av.ep_list, av_entry) {
-		util_ep = container_of(av_entry, struct util_ep, av_entry);
-		av->foreach_ep(&av->util_av, util_ep);
-	}
-
+	rxm_av_foreach_ep(av);
 out:
 	free(user_ids);
 	if (ret)
@@ -362,6 +367,7 @@ static int rxm_av_insertsym(struct fid_av *av_fid, const char *node,
 		return ret;
 	}
 
+	rxm_av_foreach_ep(av);
 	free(addr);
 	return (int) count;
 }

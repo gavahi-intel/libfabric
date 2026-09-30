@@ -46,6 +46,7 @@ rxm_recvmsg(struct fid_ep *ep_fid, const struct fi_msg *msg, uint64_t flags)
 	struct rxm_ep *rxm_ep = container_of(ep_fid, struct rxm_ep,
 					     util_ep.ep_fid.fid);
 
+	rxm_ep_unspec_migrate(rxm_ep);
 	return util_srx_generic_recv(&rxm_ep->srx->ep_fid, msg->msg_iov,
 				     msg->desc, msg->iov_count, msg->addr,
 				     msg->context,
@@ -64,6 +65,7 @@ rxm_recv(struct fid_ep *ep_fid, void *buf, size_t len,
 		.iov_len	= len,
 	};
 
+	rxm_ep_unspec_migrate(rxm_ep);
 	return util_srx_generic_recv(&rxm_ep->srx->ep_fid, &iov, &desc, 1,
 				     src_addr, context,
 				     rxm_ep->util_ep.rx_op_flags);
@@ -76,6 +78,7 @@ rxm_recvv(struct fid_ep *ep_fid, const struct iovec *iov,
 	struct rxm_ep *rxm_ep = container_of(ep_fid, struct rxm_ep,
 					     util_ep.ep_fid.fid);
 
+	rxm_ep_unspec_migrate(rxm_ep);
 	return util_srx_generic_recv(&rxm_ep->srx->ep_fid, iov, desc, count,
 				     src_addr, context,
 				     rxm_ep->util_ep.rx_op_flags);

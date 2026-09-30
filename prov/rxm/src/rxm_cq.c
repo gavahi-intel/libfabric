@@ -529,6 +529,38 @@ static bool rxm_sar_drain_pkt_list(struct rxm_proto_info *proto_info,
 	return false;
 }
 
+/* The owner queues an unexpected entry whose source is not known yet on its
+ * unspec queues, which directed receives don't search.  Flag the conn so that
+ * rxm_flush_unspec() moves such entries once the peer is resolved.
+ */
+static void rxm_mark_unspec(struct rxm_rx_buf *rx_buf,
+			    struct fi_peer_rx_entry *rx_entry)
+{
+	if (rx_entry->addr == FI_ADDR_UNSPEC && rx_buf->conn)
+		rx_buf->conn->flags |= RXM_CONN_UNSPEC_UNEXP;
+}
+
+/* Called under the ep lock before a message from a resolved peer is matched.
+ * Entries queued while the peer was unknown are moved to it first, or the
+ * message could overtake them: after fi_av_insert() resolves the peer, they
+ * stay on the unspec queues until the next receive post moves them (see
+ * rxm_foreach_ep()).  They all resolve through conn->peer, so a single flush
+ * takes every one of them.
+ */
+static void rxm_flush_unspec(struct rxm_rx_buf *rx_buf, fi_addr_t addr)
+{
+	struct fid_peer_srx *srx = rx_buf->ep->srx;
+
+	if (addr == FI_ADDR_UNSPEC ||
+	    !(rx_buf->conn->flags & RXM_CONN_UNSPEC_UNEXP))
+		return;
+
+	if (FI_CHECK_OP(srx->owner_ops, struct fi_ops_srx_owner,
+			flush_unspec_for_addr))
+		srx->owner_ops->flush_unspec_for_addr(srx, addr, rxm_get_addr);
+	rx_buf->conn->flags &= ~RXM_CONN_UNSPEC_UNEXP;
+}
+
 /* Acquire the SRX entry for a deferred reassembly, once FIRST has arrived.
  * *matched reports whether a posted receive was found or the entry had to be
  * queued as unexpected.
@@ -540,6 +572,13 @@ rxm_sar_acquire_entry(struct rxm_rx_buf *rx_buf, bool *matched)
 	struct fi_peer_rx_entry *rx_entry = NULL;
 	struct fi_peer_match_attr match = {0};
 	int ret;
+
+	/* rxm_sar_handle_segment() has set rx_buf->conn. */
+	if (rx_buf->ep->rxm_info->caps & (FI_SOURCE | FI_DIRECTED_RECV))
+		match.addr = rx_buf->conn->peer->fi_addr;
+	else
+		match.addr = FI_ADDR_UNSPEC;
+	rxm_flush_unspec(rx_buf, match.addr);
 
 	switch (rx_buf->pkt.hdr.op) {
 	case ofi_op_msg:
@@ -567,6 +606,7 @@ rxm_sar_acquire_entry(struct rxm_rx_buf *rx_buf, bool *matched)
 			rx_entry->flags |= FI_REMOTE_CQ_DATA;
 			rx_entry->cq_data = rx_buf->pkt.hdr.data;
 		}
+		rxm_mark_unspec(rx_buf, rx_entry);
 		if (rx_buf->pkt.hdr.op == ofi_op_msg)
 			srx->owner_ops->queue_msg(rx_entry);
 		else
@@ -902,6 +942,7 @@ static inline void rxm_entry_prep_for_queue(struct fi_peer_rx_entry *rx_entry,
 		rx_entry->flags |= FI_REMOTE_CQ_DATA;
 		rx_entry->cq_data = rx_buf->pkt.hdr.data;
 	}
+	rxm_mark_unspec(rx_buf, rx_entry);
 	if (rx_buf->pkt.ctrl_hdr.type == rxm_ctrl_seg)
 		rxm_init_sar_proto(rx_buf);
 	rxm_replace_rx_buf(rx_buf);
@@ -929,6 +970,8 @@ static ssize_t rxm_handle_recv_comp(struct rxm_rx_buf *rx_buf)
 		rxm_finish_buf_recv(rx_buf);
 		return 0;
 	}
+
+	rxm_flush_unspec(rx_buf, match.addr);
 
 	switch(rx_buf->pkt.hdr.op) {
 	case ofi_op_msg:

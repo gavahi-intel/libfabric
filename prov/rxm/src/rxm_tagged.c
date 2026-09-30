@@ -54,6 +54,7 @@ rxm_trecvmsg(struct fid_ep *ep_fid, const struct fi_msg_tagged *msg,
 	if (flags & FI_PEER_TRANSFER)
 		tag |= RXM_PEER_XFER_TAG_FLAG;
 
+	rxm_ep_unspec_migrate(rxm_ep);
 	return util_srx_generic_trecv(&rxm_ep->srx->ep_fid, msg->msg_iov,
 				      msg->desc, msg->iov_count, msg->addr,
 				      msg->context, tag, msg->ignore,
@@ -72,6 +73,7 @@ rxm_trecv(struct fid_ep *ep_fid, void *buf, size_t len,
 	};
 
 	rxm_ep = container_of(ep_fid, struct rxm_ep, util_ep.ep_fid.fid);
+	rxm_ep_unspec_migrate(rxm_ep);
 	return util_srx_generic_trecv(&rxm_ep->srx->ep_fid, &iov, &desc, 1,
 				      src_addr, context, tag, ignore,
 				      rxm_ep->util_ep.rx_op_flags);
@@ -85,6 +87,7 @@ rxm_trecvv(struct fid_ep *ep_fid, const struct iovec *iov,
 	struct rxm_ep *rxm_ep;
 
 	rxm_ep = container_of(ep_fid, struct rxm_ep, util_ep.ep_fid.fid);
+	rxm_ep_unspec_migrate(rxm_ep);
 	return util_srx_generic_trecv(&rxm_ep->srx->ep_fid, iov, desc, count,
 				      src_addr, context, tag, ignore,
 				      rxm_ep->util_ep.rx_op_flags);

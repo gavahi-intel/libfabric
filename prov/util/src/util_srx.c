@@ -501,6 +501,59 @@ static void util_foreach_unspec(struct fid_peer_srx *srx,
 	ofi_genlock_unlock(&srx_ctx->unspec_lock);
 }
 
+static void util_flush_unspec_queue(struct fid_peer_srx *srx,
+		struct dlist_entry *unspec_queue, struct slist *queue,
+		struct util_unexp_peer *unexp_peer, fi_addr_t addr,
+		fi_addr_t (*get_addr)(struct fi_peer_rx_entry *))
+{
+	struct util_srx_ctx *srx_ctx = srx->ep_fid.fid.context;
+	struct util_rx_entry *rx_entry;
+	struct dlist_entry *tmp;
+
+	dlist_foreach_container_safe(unspec_queue, struct util_rx_entry,
+				     rx_entry, d_entry, tmp) {
+		if (rx_entry->peer_entry.srx != srx ||
+		    get_addr(&rx_entry->peer_entry) != addr)
+			continue;
+
+		rx_entry->peer_entry.addr = addr;
+		dlist_remove(&rx_entry->d_entry);
+		slist_insert_tail(&rx_entry->s_entry, queue);
+		if (!unexp_peer->cnt++)
+			dlist_insert_tail(&unexp_peer->entry,
+					  &srx_ctx->unexp_peers);
+	}
+}
+
+/* Like util_foreach_unspec(), but only for the entries that resolve to addr,
+ * which the caller is about to match a newer message from.
+ */
+static void util_flush_unspec_for_addr(struct fid_peer_srx *srx,
+		fi_addr_t addr,
+		fi_addr_t (*get_addr)(struct fi_peer_rx_entry *))
+{
+	struct util_srx_ctx *srx_ctx = srx->ep_fid.fid.context;
+	struct util_unexp_peer *unexp_peer;
+
+	assert(ofi_genlock_held(srx_ctx->lock));
+	if (addr == FI_ADDR_UNSPEC || !srx_ctx->dir_recv)
+		return;
+
+	ofi_genlock_lock(&srx_ctx->unspec_lock);
+	if (!dlist_empty(&srx_ctx->unspec_unexp_msg_queue) ||
+	    !dlist_empty(&srx_ctx->unspec_unexp_tag_queue)) {
+		unexp_peer = ofi_array_at(&srx_ctx->src_unexp_peers, addr);
+		assert(unexp_peer);
+		util_flush_unspec_queue(srx, &srx_ctx->unspec_unexp_msg_queue,
+					&unexp_peer->msg_queue, unexp_peer,
+					addr, get_addr);
+		util_flush_unspec_queue(srx, &srx_ctx->unspec_unexp_tag_queue,
+					&unexp_peer->tag_queue, unexp_peer,
+					addr, get_addr);
+	}
+	ofi_genlock_unlock(&srx_ctx->unspec_lock);
+}
+
 static struct fi_ops_srx_owner util_srx_owner_ops = {
 	.size = sizeof(struct fi_ops_srx_owner),
 	.get_msg = util_get_msg,
@@ -509,6 +562,7 @@ static struct fi_ops_srx_owner util_srx_owner_ops = {
 	.queue_tag = util_queue_tag,
 	.foreach_unspec_addr = util_foreach_unspec,
 	.free_entry = util_free_entry,
+	.flush_unspec_for_addr = util_flush_unspec_for_addr,
 };
 
 static struct util_rx_entry *util_search_peer_msg(struct util_unexp_peer *peer)

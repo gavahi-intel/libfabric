@@ -194,6 +194,9 @@ struct fi_ops_srx_owner {
 			fi_addr_t (*get_addr)(struct fi_peer_rx_entry *));
 
 	void	(*free_entry)(struct fi_peer_rx_entry *entry);
+	void	(*flush_unspec_for_addr)(struct fid_peer_srx *srx,
+			fi_addr_t addr,
+			fi_addr_t (*get_addr)(struct fi_peer_rx_entry *));
 };
 
 struct fi_ops_srx_peer {

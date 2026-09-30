@@ -221,7 +221,7 @@ static struct fi_ops_av_owner rxm_av_owner_ops = {
 	.ep_addr = rxm_peer_av_ep_addr,
 };
 
-static fi_addr_t rxm_get_addr(struct fi_peer_rx_entry *rx_entry)
+fi_addr_t rxm_get_addr(struct fi_peer_rx_entry *rx_entry)
 {
 	struct rxm_rx_buf *rx_buf = rx_entry->peer_context;
 
@@ -231,6 +231,22 @@ static fi_addr_t rxm_get_addr(struct fi_peer_rx_entry *rx_entry)
 	return rx_buf->conn->peer->fi_addr;
 }
 
+void rxm_ep_do_unspec_migrate(struct rxm_ep *rxm_ep)
+{
+	ofi_genlock_lock(&rxm_ep->util_ep.lock);
+	if (ofi_atomic_cas_bool32(&rxm_ep->unspec_migrate, 1, 0))
+		rxm_ep->srx->owner_ops->foreach_unspec_addr(rxm_ep->srx,
+							    &rxm_get_addr);
+	ofi_genlock_unlock(&rxm_ep->util_ep.lock);
+}
+
+/* foreach_unspec_addr() moves entries onto the queues that get_msg/tag() and
+ * queue_msg/tag() use, so it needs the ep lock those are called with.  Taking
+ * that lock here would stall every fi_av_insert() behind a busy progress
+ * thread.  With rxm's own srx, every receive is posted through rxm, so leave
+ * the move to the next one: only a directed receive has to find the entries
+ * moved.
+ */
 static void rxm_foreach_ep(struct util_av *av, struct util_ep *ep)
 {
 	struct rxm_ep *rxm_ep;
@@ -238,9 +254,18 @@ static void rxm_foreach_ep(struct util_av *av, struct util_ep *ep)
 
 	rxm_ep = container_of(ep, struct rxm_ep, util_ep);
 	peer_srx = container_of(rxm_ep->srx, struct fid_peer_srx, ep_fid);
-	if (peer_srx) {
-		peer_srx->owner_ops->foreach_unspec_addr(peer_srx, &rxm_get_addr);
+	if (!peer_srx)
+		return;
+
+	if (rxm_ep->util_ep.ep_fid.msg != &rxm_no_recv_msg_ops) {
+		ofi_atomic_set32(&rxm_ep->unspec_migrate, 1);
+		return;
 	}
+
+	/* The receives for a peer srx are posted to its owner. */
+	ofi_genlock_lock(&rxm_ep->util_ep.lock);
+	peer_srx->owner_ops->foreach_unspec_addr(peer_srx, &rxm_get_addr);
+	ofi_genlock_unlock(&rxm_ep->util_ep.lock);
 }
 
 

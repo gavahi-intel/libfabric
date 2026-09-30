@@ -232,6 +232,8 @@ enum rxm_cm_state {
 
 enum {
 	RXM_CONN_INDEXED = BIT(0),
+	/* may have entries on the srx owner's unspec queues */
+	RXM_CONN_UNSPEC_UNEXP = BIT(1),
 };
 
 /* Each local rxm ep will have at most 1 connection to a single
@@ -708,6 +710,8 @@ struct rxm_ep {
 	uint64_t		offload_coll_mask;
 
 	struct fid_peer_srx	*srx;
+	/* set when an AV insert may have made unspec entries resolvable */
+	ofi_atomic32_t		unspec_migrate;
 
 	struct fid_cq 		*msg_cq;
 	uint64_t		msg_cq_last_poll;
@@ -746,6 +750,18 @@ struct rxm_ep {
 	struct rxm_rndv_ops	*rndv_ops;
 };
 
+void rxm_ep_do_unspec_migrate(struct rxm_ep *rxm_ep);
+
+/* Called before posting a receive, without the ep lock.  Runs a
+ * foreach_unspec_addr() that rxm_foreach_ep() left pending, so that a directed
+ * receive finds the entries of peers inserted since then.
+ */
+static inline void rxm_ep_unspec_migrate(struct rxm_ep *rxm_ep)
+{
+	if (ofi_atomic_get32(&rxm_ep->unspec_migrate))
+		rxm_ep_do_unspec_migrate(rxm_ep);
+}
+
 int rxm_start_listen(struct rxm_ep *ep);
 void rxm_stop_listen(struct rxm_ep *ep);
 void rxm_conn_progress(struct rxm_ep *ep);
@@ -777,6 +793,8 @@ ssize_t rxm_handle_rx_buf(struct rxm_rx_buf *rx_buf);
 
 int rxm_srx_context(struct fid_domain *domain, struct fi_rx_attr *attr,
 		    struct fid_ep **rx_ep, void *context);
+
+fi_addr_t rxm_get_addr(struct fi_peer_rx_entry *rx_entry);
 
 int rxm_endpoint(struct fid_domain *domain, struct fi_info *info,
 			  struct fid_ep **ep, void *context);
