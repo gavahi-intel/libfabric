@@ -42,22 +42,178 @@
  * return the version.  The returned version must be <= the requested
  * version, and is used by the active side to fallback to an older
  * protocol version.
+ *
+ * Wire format.  Multi-byte integers are in network byte order and the
+ * layout has no implicit padding (checked below):
+ *
+ *   offset size  field
+ *   0      1     version
+ *   1      1     features   XNET_RDM_* flags
+ *   2      2     port       sender's RDM listening port
+ *   4      4     pid        sender's process id
+ *   ------------ XNET_RDM_CM_BASE_SIZE: sent by all protocol versions
+ *   8      1     addr_type  XNET_RDM_ADDR_IN or XNET_RDM_ADDR_IN6
+ *   9      3     reserved   zero on send, ignored on receipt
+ *   12     4     scope_id   IPv6 scope id of addr, zero for IPv4
+ *   16     16    addr       IPv4 address in the first 4 bytes (rest zero),
+ *                           or IPv6 address
+ *   ------------ XNET_RDM_CM_SRC_ADDR_SIZE
+ *
+ * The source address extension (offset 8 onwards) is present only in a
+ * connection request with XNET_RDM_SRC_ADDR set.  It carries the sender's
+ * RDM address (its fi_getname() address), which is the address peers insert
+ * into their AV.  Responses carry only the base message; XNET_RDM_SRC_ADDR in
+ * an accept response acknowledges that the advertised address was used.
+ * Receivers ignore data beyond the fields they know.
  */
 struct xnet_rdm_cm {
 	uint8_t version;
 	uint8_t features;
 	uint16_t port;
 	uint32_t pid;
+	uint8_t addr_type;
+	uint8_t reserved[3];
+	uint32_t scope_id;
+	uint8_t addr[16];
 };
+
+#define XNET_RDM_CM_BASE_SIZE offsetof(struct xnet_rdm_cm, addr_type)
+#define XNET_RDM_CM_SRC_ADDR_SIZE sizeof(struct xnet_rdm_cm)
+
+_Static_assert(XNET_RDM_CM_BASE_SIZE == 8, "xnet_rdm_cm base size");
+_Static_assert(offsetof(struct xnet_rdm_cm, scope_id) == 12,
+	       "xnet_rdm_cm scope_id offset");
+_Static_assert(offsetof(struct xnet_rdm_cm, addr) == 16,
+	       "xnet_rdm_cm addr offset");
+_Static_assert(XNET_RDM_CM_SRC_ADDR_SIZE == 32, "xnet_rdm_cm size");
+_Static_assert(XNET_RDM_CM_SRC_ADDR_SIZE <= XNET_MAX_CM_DATA_SIZE,
+	       "xnet_rdm_cm exceeds cm data size");
 
 /*
  * RDM feature flag xnet_rdm_cm::features, bit wised.
  */
 enum {
 	XNET_RDM_FIREWALL_ADDR = 1 << 0,
+	XNET_RDM_SRC_ADDR = 1 << 1,
 	XNET_RDM_RESERVED = 1 << 7,
 };
-#define XNET_RDM_FEATURES (XNET_RDM_FIREWALL_ADDR)
+#define XNET_RDM_FEATURES (XNET_RDM_FIREWALL_ADDR | XNET_RDM_SRC_ADDR)
+
+/* xnet_rdm_cm::addr_type values, independent of the platform's AF_* values */
+enum {
+	XNET_RDM_ADDR_IN = 4,
+	XNET_RDM_ADDR_IN6 = 6,
+};
+
+/* Advertise our RDM address in a connection request.  Nothing is advertised
+ * for a wildcard address, which does not identify an endpoint.
+ */
+static void xnet_set_rdm_addr(struct xnet_rdm_cm *msg,
+			      const union ofi_sock_ip *addr)
+{
+	if (ofi_is_any_addr(&addr->sa))
+		return;
+
+	switch (addr->sa.sa_family) {
+	case AF_INET:
+		msg->addr_type = XNET_RDM_ADDR_IN;
+		memcpy(msg->addr, &addr->sin.sin_addr,
+		       sizeof(addr->sin.sin_addr));
+		break;
+	case AF_INET6:
+		msg->addr_type = XNET_RDM_ADDR_IN6;
+		msg->scope_id = htonl(addr->sin6.sin6_scope_id);
+		memcpy(msg->addr, &addr->sin6.sin6_addr,
+		       sizeof(addr->sin6.sin6_addr));
+		break;
+	default:
+		return;
+	}
+	msg->features |= XNET_RDM_SRC_ADDR;
+}
+
+/* Build the peer's advertised RDM address.  The local RDM address is used as
+ * the template so that the result has the same layout (family, zeroed and
+ * platform specific fields) as the addresses the application inserts into
+ * the AV.  Returns false if the advertised address cannot be used.
+ */
+static bool xnet_get_rdm_addr(const struct xnet_rdm_cm *msg,
+			      const union ofi_sock_ip *local_addr,
+			      union ofi_sock_ip *peer_addr)
+{
+	switch (msg->addr_type) {
+	case XNET_RDM_ADDR_IN:
+		if (local_addr->sa.sa_family != AF_INET)
+			return false;
+		*peer_addr = *local_addr;
+		memcpy(&peer_addr->sin.sin_addr, msg->addr,
+		       sizeof(peer_addr->sin.sin_addr));
+		break;
+	case XNET_RDM_ADDR_IN6:
+		if (local_addr->sa.sa_family != AF_INET6)
+			return false;
+		*peer_addr = *local_addr;
+		peer_addr->sin6.sin6_flowinfo = 0;
+		peer_addr->sin6.sin6_scope_id = ntohl(msg->scope_id);
+		memcpy(&peer_addr->sin6.sin6_addr, msg->addr,
+		       sizeof(peer_addr->sin6.sin6_addr));
+		break;
+	default:
+		return false;
+	}
+
+	ofi_addr_set_port(&peer_addr->sa, ntohs(msg->port));
+	return !ofi_is_any_addr(&peer_addr->sa);
+}
+
+/* Determine the identity of the peer sending a connection request: the key
+ * used to look up its util_peer_addr, which selects the conn (peer->index)
+ * that the AV, FI_DIRECTED_RECV and FI_SOURCE use for that peer.
+ *
+ * The address observed on the accepted socket (getpeername) is the transport
+ * address, which NAT, policy routing or multi-homed hosts may make differ
+ * from the address the peer advertises and the application inserted into
+ * the AV.  Only the identity comes from the advertised address; the accepted
+ * endpoint keeps using the connected socket and the connection info as is.
+ *
+ * Trust: the tcp provider does not authenticate peers.  As has always been
+ * the case for the listening port and pid, the connecting process is trusted
+ * to report its own RDM identity, so any process that can reach the listening
+ * port can claim to be any peer.  Access to the listening ports must be
+ * restricted (e.g. FI_TCP_PORT_LOW_RANGE/FI_TCP_PORT_HIGH_RANGE and firewall
+ * rules) if that is not acceptable.  Without the source address extension
+ * (older peers), the observed address with the advertised port is used.
+ */
+static void xnet_get_peer_id(struct xnet_rdm *rdm, struct xnet_rdm_cm *msg,
+			     const struct sockaddr *observed_addr,
+			     union ofi_sock_ip *peer_addr)
+{
+	if (msg->features & XNET_RDM_SRC_ADDR) {
+		if (xnet_get_rdm_addr(msg, &rdm->addr, peer_addr)) {
+			if (!ofi_equals_ipaddr(&peer_addr->sa, observed_addr)) {
+				ofi_straddr_log(&xnet_prov, FI_LOG_INFO,
+						FI_LOG_EP_CTRL,
+						"connreq transport addr",
+						observed_addr);
+				ofi_straddr_log(&xnet_prov, FI_LOG_INFO,
+						FI_LOG_EP_CTRL,
+						"connreq peer identity",
+						&peer_addr->sa);
+			}
+			return;
+		}
+
+		FI_WARN_SPARSE(&xnet_prov, FI_LOG_EP_CTRL,
+			"ignoring invalid advertised peer address, type %u\n",
+			msg->addr_type);
+		msg->features &= ~XNET_RDM_SRC_ADDR;
+	}
+
+	memset(peer_addr, 0, sizeof(*peer_addr));
+	memcpy(peer_addr, observed_addr,
+	       MIN(ofi_sizeofaddr(observed_addr), sizeof(*peer_addr)));
+	ofi_addr_set_port(&peer_addr->sa, ntohs(msg->port));
+}
 
 static int xnet_match_event(struct slist_entry *item, const void *arg)
 {
@@ -236,17 +392,20 @@ static int xnet_rdm_connect(struct xnet_conn *conn)
 	if (ret)
 		return ret;
 
+	memset(&msg, 0, sizeof(msg));
 	msg.version = XNET_RDM_VERSION;
 	msg.pid = htonl((uint32_t) getpid());
 	msg.features = xnet_firewall_addr ? XNET_RDM_FIREWALL_ADDR : 0;
 	msg.port = htons(ofi_addr_get_port(&conn->rdm->addr.sa));
+	xnet_set_rdm_addr(&msg, &conn->rdm->addr);
 
 	ofi_straddr_dbg(&xnet_prov, FI_LOG_EP_CTRL, "rdm addr",
 			&conn->rdm->addr);
 	ofi_straddr_dbg(&xnet_prov, FI_LOG_EP_CTRL, "src addr", info->src_addr);
 
 	ret = fi_connect(&conn->ep->util_ep.ep_fid, info->dest_addr, &msg,
-			 sizeof msg);
+			 (msg.features & XNET_RDM_SRC_ADDR) ?
+			 XNET_RDM_CM_SRC_ADDR_SIZE : XNET_RDM_CM_BASE_SIZE);
 	if (ret) {
 		XNET_WARN_ERR(FI_LOG_EP_CTRL, "fi_connect", ret);
 		goto err;
@@ -438,10 +597,11 @@ static void xnet_set_rdm_version(struct xnet_rdm_cm *msg)
 	msg->version |= XNET_RDM_VERSION_FLAG;
 }
 
-static void xnet_process_connreq(struct fi_eq_cm_entry *cm_entry)
+static void xnet_process_connreq(struct fi_eq_cm_entry *cm_entry,
+				 size_t datalen)
 {
 	struct xnet_rdm *rdm;
-	struct xnet_rdm_cm *msg;
+	struct xnet_rdm_cm *msg, msg_buf = {0};
 	union ofi_sock_ip peer_addr;
 	struct util_peer_addr *peer;
 	struct xnet_conn *conn;
@@ -452,11 +612,24 @@ static void xnet_process_connreq(struct fi_eq_cm_entry *cm_entry)
 	assert(cm_entry->fid->fclass == FI_CLASS_PEP);
 	rdm = cm_entry->fid->context;
 	assert(xnet_progress_locked(xnet_rdm2_progress(rdm)));
-	msg = (struct xnet_rdm_cm *) cm_entry->data;
 
-	memcpy(&peer_addr, cm_entry->info->dest_addr,
-	       cm_entry->info->dest_addrlen);
-	ofi_addr_set_port(&peer_addr.sa, ntohs(msg->port));
+	/* Parse from a zeroed copy: the data may be shorter than the struct
+	 * (base message from older peers), and replies are built from it.
+	 */
+	msg = &msg_buf;
+	if (datalen < XNET_RDM_CM_BASE_SIZE) {
+		FI_WARN(&xnet_prov, FI_LOG_EP_CTRL,
+			"connreq data too short: %zu bytes\n", datalen);
+		goto reject;
+	}
+	memcpy(msg, cm_entry->data, MIN(datalen, sizeof(*msg)));
+	if (datalen < XNET_RDM_CM_SRC_ADDR_SIZE)
+		msg->features &= ~XNET_RDM_SRC_ADDR;
+
+	/* cm_entry->info, which holds the accepted socket and its observed
+	 * address, is passed unmodified to xnet_open_conn() below.
+	 */
+	xnet_get_peer_id(rdm, msg, cm_entry->info->dest_addr, &peer_addr);
 
 	flags = (msg->features & XNET_RDM_FIREWALL_ADDR) ? FI_FIREWALL_ADDR : 0;
 	av = container_of(rdm->util_ep.av, struct rxm_av, util_av);
@@ -546,7 +719,7 @@ accept:
 	xnet_set_rdm_version(msg);
 	xnet_set_protocol(conn->ep, msg);
 
-	ret = fi_accept(&conn->ep->util_ep.ep_fid, msg, sizeof(*msg));
+	ret = fi_accept(&conn->ep->util_ep.ep_fid, msg, XNET_RDM_CM_BASE_SIZE);
 	if (ret)
 		goto close;
 
@@ -561,7 +734,7 @@ put:
 	util_put_peer(peer);
 reject:
 	(void) fi_reject(&rdm->pep->util_pep.pep_fid, cm_entry->info->handle,
-			 msg, sizeof(*msg));
+			 msg, XNET_RDM_CM_BASE_SIZE);
 	fi_freeinfo(cm_entry->info);
 }
 
@@ -595,7 +768,9 @@ void xnet_handle_event_list(struct xnet_progress *progress)
 
 		switch (event->event) {
 		case FI_CONNREQ:
-			xnet_process_connreq(&event->cm_entry);
+			assert(event->len >= sizeof(struct fi_eq_cm_entry));
+			xnet_process_connreq(&event->cm_entry, event->len -
+					     sizeof(struct fi_eq_cm_entry));
 			break;
 		case FI_CONNECTED:
 			xnet_process_connected(&event->cm_entry);
