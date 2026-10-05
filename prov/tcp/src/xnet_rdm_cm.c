@@ -59,6 +59,94 @@ enum {
 };
 #define XNET_RDM_FEATURES (XNET_RDM_FIREWALL_ADDR)
 
+/* A connection request may append the sender's RDM address (the address
+ * returned by fi_getname and inserted into peers' AVs) to xnet_rdm_cm.
+ * It is present if the connection data is longer than xnet_rdm_cm, and
+ * is encoded as a family byte followed by, in network byte order:
+ *
+ *   XNET_RDM_ADDR_IN:  IPv4 address (4 bytes)
+ *   XNET_RDM_ADDR_IN6: IPv6 address (16 bytes), scope id (4 bytes)
+ *
+ * Family 0 is reserved for no address (the family byte only), so that
+ * fields can be appended after the address in the future.
+ * Older versions send only xnet_rdm_cm and ignore trailing data.  The
+ * accept and reject responses carry only xnet_rdm_cm.
+ */
+enum {
+	XNET_RDM_ADDR_IN = 4,
+	XNET_RDM_ADDR_IN6 = 6,
+};
+#define XNET_RDM_ADDR_IN_SIZE (1 + 4)
+#define XNET_RDM_ADDR_IN6_SIZE (1 + 16 + 4)
+
+struct xnet_rdm_connreq {
+	struct xnet_rdm_cm msg;
+	uint8_t addr[XNET_RDM_ADDR_IN6_SIZE];
+};
+
+/* Returns the encoded size, or 0 if addr does not identify the endpoint. */
+static size_t xnet_put_rdm_addr(uint8_t *buf, const union ofi_sock_ip *addr)
+{
+	uint32_t scope_id;
+
+	if (ofi_is_any_addr(&addr->sa))
+		return 0;
+
+	switch (addr->sa.sa_family) {
+	case AF_INET:
+		buf[0] = XNET_RDM_ADDR_IN;
+		memcpy(&buf[1], &addr->sin.sin_addr, 4);
+		return XNET_RDM_ADDR_IN_SIZE;
+	case AF_INET6:
+		buf[0] = XNET_RDM_ADDR_IN6;
+		memcpy(&buf[1], &addr->sin6.sin6_addr, 16);
+		scope_id = htonl(addr->sin6.sin6_scope_id);
+		memcpy(&buf[17], &scope_id, 4);
+		return XNET_RDM_ADDR_IN6_SIZE;
+	default:
+		return 0;
+	}
+}
+
+/* Decode the peer's RDM address from a connection request of len bytes.
+ * The local RDM address is used as the template, so that the result has
+ * the same layout as the addresses in the AV, which are compared bytewise.
+ * Returns false if the request does not carry a usable address.
+ */
+static bool xnet_get_rdm_addr(const struct xnet_rdm_connreq *req, size_t len,
+			      const union ofi_sock_ip *local,
+			      union ofi_sock_ip *addr)
+{
+	uint32_t scope_id;
+
+	if (len <= sizeof(req->msg))
+		return false;
+
+	len -= sizeof(req->msg);
+	*addr = *local;
+	switch (req->addr[0]) {
+	case XNET_RDM_ADDR_IN:
+		if (len < XNET_RDM_ADDR_IN_SIZE || local->sa.sa_family != AF_INET)
+			return false;
+		memcpy(&addr->sin.sin_addr, &req->addr[1], 4);
+		break;
+	case XNET_RDM_ADDR_IN6:
+		if (len < XNET_RDM_ADDR_IN6_SIZE ||
+		    local->sa.sa_family != AF_INET6)
+			return false;
+		memcpy(&addr->sin6.sin6_addr, &req->addr[1], 16);
+		memcpy(&scope_id, &req->addr[17], 4);
+		addr->sin6.sin6_flowinfo = 0;
+		addr->sin6.sin6_scope_id = ntohl(scope_id);
+		break;
+	default:
+		return false;
+	}
+
+	ofi_addr_set_port(&addr->sa, ntohs(req->msg.port));
+	return !ofi_is_any_addr(&addr->sa);
+}
+
 static int xnet_match_event(struct slist_entry *item, const void *arg)
 {
 	struct xnet_event *event;
@@ -217,8 +305,9 @@ err:
 
 static int xnet_rdm_connect(struct xnet_conn *conn)
 {
-	struct xnet_rdm_cm msg;
+	struct xnet_rdm_connreq req;
 	struct fi_info *info;
+	size_t len;
 	int ret;
 
 	FI_DBG(&xnet_prov, FI_LOG_EP_CTRL, "connecting %p\n", conn);
@@ -236,17 +325,17 @@ static int xnet_rdm_connect(struct xnet_conn *conn)
 	if (ret)
 		return ret;
 
-	msg.version = XNET_RDM_VERSION;
-	msg.pid = htonl((uint32_t) getpid());
-	msg.features = xnet_firewall_addr ? XNET_RDM_FIREWALL_ADDR : 0;
-	msg.port = htons(ofi_addr_get_port(&conn->rdm->addr.sa));
+	req.msg.version = XNET_RDM_VERSION;
+	req.msg.pid = htonl((uint32_t) getpid());
+	req.msg.features = xnet_firewall_addr ? XNET_RDM_FIREWALL_ADDR : 0;
+	req.msg.port = htons(ofi_addr_get_port(&conn->rdm->addr.sa));
+	len = sizeof(req.msg) + xnet_put_rdm_addr(req.addr, &conn->rdm->addr);
 
 	ofi_straddr_dbg(&xnet_prov, FI_LOG_EP_CTRL, "rdm addr",
 			&conn->rdm->addr);
 	ofi_straddr_dbg(&xnet_prov, FI_LOG_EP_CTRL, "src addr", info->src_addr);
 
-	ret = fi_connect(&conn->ep->util_ep.ep_fid, info->dest_addr, &msg,
-			 sizeof msg);
+	ret = fi_connect(&conn->ep->util_ep.ep_fid, info->dest_addr, &req, len);
 	if (ret) {
 		XNET_WARN_ERR(FI_LOG_EP_CTRL, "fi_connect", ret);
 		goto err;
@@ -420,6 +509,7 @@ static void xnet_set_protocol(struct xnet_ep *ep, struct xnet_rdm_cm *msg)
 		return;
 
 	switch (msg->version & ~XNET_RDM_VERSION_FLAG) {
+	case 2:
 	case 1:
 		ep->util_ep.flags |= XNET_EP_RENDEZVOUS;
 		/* fall through */
@@ -438,7 +528,8 @@ static void xnet_set_rdm_version(struct xnet_rdm_cm *msg)
 	msg->version |= XNET_RDM_VERSION_FLAG;
 }
 
-static void xnet_process_connreq(struct fi_eq_cm_entry *cm_entry)
+static void xnet_process_connreq(struct fi_eq_cm_entry *cm_entry,
+				 size_t datalen)
 {
 	struct xnet_rdm *rdm;
 	struct xnet_rdm_cm *msg;
@@ -454,9 +545,20 @@ static void xnet_process_connreq(struct fi_eq_cm_entry *cm_entry)
 	assert(xnet_progress_locked(xnet_rdm2_progress(rdm)));
 	msg = (struct xnet_rdm_cm *) cm_entry->data;
 
-	memcpy(&peer_addr, cm_entry->info->dest_addr,
-	       cm_entry->info->dest_addrlen);
-	ofi_addr_set_port(&peer_addr.sa, ntohs(msg->port));
+	/* Identify the peer by the address it advertised, which is what the
+	 * application inserted into the AV.  The observed address, which NAT
+	 * or routing may change, is only used by the connection itself.
+	 * Older peers do not advertise an address; use the observed address
+	 * with their listening port.
+	 */
+	if (!xnet_get_rdm_addr((struct xnet_rdm_connreq *) cm_entry->data,
+			       datalen, &rdm->addr, &peer_addr)) {
+		memcpy(&peer_addr, cm_entry->info->dest_addr,
+		       cm_entry->info->dest_addrlen);
+		ofi_addr_set_port(&peer_addr.sa, ntohs(msg->port));
+	}
+	ofi_straddr_dbg(&xnet_prov, FI_LOG_EP_CTRL, "connreq peer addr",
+			&peer_addr);
 
 	flags = (msg->features & XNET_RDM_FIREWALL_ADDR) ? FI_FIREWALL_ADDR : 0;
 	av = container_of(rdm->util_ep.av, struct rxm_av, util_av);
@@ -595,7 +697,8 @@ void xnet_handle_event_list(struct xnet_progress *progress)
 
 		switch (event->event) {
 		case FI_CONNREQ:
-			xnet_process_connreq(&event->cm_entry);
+			xnet_process_connreq(&event->cm_entry, event->len -
+					     sizeof(struct fi_eq_cm_entry));
 			break;
 		case FI_CONNECTED:
 			xnet_process_connected(&event->cm_entry);
