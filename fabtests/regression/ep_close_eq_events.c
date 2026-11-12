@@ -49,6 +49,7 @@
 
 #include <errno.h>
 #include <getopt.h>
+#include <stdbool.h>
 #include <rdma/fi_cm.h>
 #include <rdma/fi_domain.h>
 #include <rdma/fi_endpoint.h>
@@ -117,16 +118,34 @@ static int setup(struct test_resources *r, const char *provider,
 	return 0;
 }
 
-static void teardown(struct test_resources *r)
+/*
+ * Close fid on a cleanup path. Report a failure and return it, unless ret
+ * already holds an earlier error, which is kept.
+ */
+static int close_fid(struct fid *fid, const char *call, int ret)
+{
+	int close_ret;
+
+	close_ret = fi_close(fid);
+	if (close_ret) {
+		report(call, close_ret);
+		if (!ret)
+			ret = close_ret;
+	}
+	return ret;
+}
+
+static int teardown(struct test_resources *r, int ret)
 {
 	if (r->domain)
-		fi_close(&r->domain->fid);
+		ret = close_fid(&r->domain->fid, "fi_close(domain)", ret);
 	if (r->eq)
-		fi_close(&r->eq->fid);
+		ret = close_fid(&r->eq->fid, "fi_close(eq)", ret);
 	if (r->fabric)
-		fi_close(&r->fabric->fid);
+		ret = close_fid(&r->fabric->fid, "fi_close(fabric)", ret);
 	if (r->info)
 		fi_freeinfo(r->info);
+	return ret;
 }
 
 static int open_ep(struct test_resources *r, struct fid_ep **ep)
@@ -187,6 +206,7 @@ static int read_event(struct test_resources *r, uint32_t *event,
 static int test_close_purges_own_events(struct test_resources *r)
 {
 	struct fid_ep *ep_a = NULL, *ep_b = NULL;
+	bool ep_a_close_attempted = false, ep_b_close_attempted = false;
 	struct fi_eq_cm_entry entry;
 	struct fi_info *connreq_info;
 	uint32_t event;
@@ -215,19 +235,21 @@ static int test_close_purges_own_events(struct test_resources *r)
 		goto out;
 	}
 
+	ep_a_close_attempted = true;
 	ret = fi_close(&ep_a->fid);
-	ep_a = NULL;
 	if (ret) {
 		report("fi_close(A)", ret);
 		goto out;
 	}
+	ep_a = NULL;
 
+	ep_b_close_attempted = true;
 	ret = fi_close(&ep_b->fid);
-	ep_b = NULL;
 	if (ret) {
 		report("fi_close(B)", ret);
 		goto out;
 	}
+	ep_b = NULL;
 
 	ret = read_event(r, &event, &entry);
 	if (ret > 0) {
@@ -238,10 +260,10 @@ static int test_close_purges_own_events(struct test_resources *r)
 	}
 
 out:
-	if (ep_a)
-		fi_close(&ep_a->fid);
-	if (ep_b)
-		fi_close(&ep_b->fid);
+	if (ep_a && !ep_a_close_attempted)
+		ret = close_fid(&ep_a->fid, "fi_close(A)", ret);
+	if (ep_b && !ep_b_close_attempted)
+		ret = close_fid(&ep_b->fid, "fi_close(B)", ret);
 	return ret;
 }
 
@@ -251,6 +273,7 @@ out:
 static int test_close_keeps_other_events(struct test_resources *r)
 {
 	struct fid_ep *ep_c = NULL, *ep_d = NULL;
+	bool ep_c_close_attempted = false;
 	struct fi_eq_cm_entry entry;
 	uint32_t event;
 	int ret;
@@ -266,12 +289,13 @@ static int test_close_keeps_other_events(struct test_resources *r)
 	if (ret)
 		goto out;
 
+	ep_c_close_attempted = true;
 	ret = fi_close(&ep_c->fid);
-	ep_c = NULL;
 	if (ret) {
 		report("fi_close(C)", ret);
 		goto out;
 	}
+	ep_c = NULL;
 
 	ret = read_event(r, &event, &entry);
 	if (ret < 0)
@@ -287,10 +311,10 @@ static int test_close_keeps_other_events(struct test_resources *r)
 	ret = 0;
 
 out:
-	if (ep_c)
-		fi_close(&ep_c->fid);
+	if (ep_c && !ep_c_close_attempted)
+		ret = close_fid(&ep_c->fid, "fi_close(C)", ret);
 	if (ep_d)
-		fi_close(&ep_d->fid);
+		ret = close_fid(&ep_d->fid, "fi_close(D)", ret);
 	return ret;
 }
 
@@ -346,6 +370,6 @@ int main(int argc, char **argv)
 	printf("close keeps other events: %s\n", ret ? "FAIL" : "PASS");
 
 out:
-	teardown(&r);
+	ret = teardown(&r, ret);
 	return ret ? EXIT_FAILURE : EXIT_SUCCESS;
 }
