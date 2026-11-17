@@ -79,9 +79,10 @@
 /* PCIe proximity levels for NIC-GPU affinity */
 enum vrb_pcie_proximity {
 	VRB_PROXIMITY_BRIDGE = 0,	/* Same PCIe switch/bridge (best) */
-	VRB_PROXIMITY_PACKAGE = 1,	/* Same CPU socket (good) */
-	VRB_PROXIMITY_MACHINE = 2,	/* Different sockets (worst) */
-	VRB_PROXIMITY_UNKNOWN = 3	/* Cannot determine */
+	VRB_PROXIMITY_HOSTBRIDGE = 1,	/* Same root complex, different ports */
+	VRB_PROXIMITY_PACKAGE = 2,	/* Same CPU socket (good) */
+	VRB_PROXIMITY_MACHINE = 3,	/* Different sockets (worst) */
+	VRB_PROXIMITY_UNKNOWN = 4	/* Cannot determine */
 };
 
 /* Per-NIC info with proximity data for auto policy */
@@ -2039,24 +2040,35 @@ void vrb_devs_free(struct dlist_entry *verbs_devs)
 #define VRB_PCI_DEVICE_MAX 0x1F    /* 5 bits */
 #define VRB_PCI_FUNCTION_MAX 0x7   /* 3 bits */
 
-static int vrb_parse_pci_address(const char *pci_str, struct fi_pci_attr *pci_attr)
+/*
+ * Parse "dddd:bb:dd.f" or, as printed by lspci by default, "bb:dd.f"
+ * (domain 0). The whole string must match; callers report errors.
+ */
+int vrb_parse_pci_address(const char *pci_str, struct fi_pci_attr *pci_attr)
 {
-	unsigned int domain;
+	unsigned int domain = 0;
 	unsigned int bus;
 	unsigned int device;
 	unsigned int function;
-	int ret;
+	int len = 0;
 
-	ret = sscanf(pci_str, "%x:%x:%x.%x", &domain, &bus, &device, &function);
-	if (ret != VRB_PCI_ADDR_COMPONENTS ||
-	    domain > VRB_PCI_DOMAIN_MAX || bus > VRB_PCI_BUS_MAX ||
-	    device > VRB_PCI_DEVICE_MAX || function > VRB_PCI_FUNCTION_MAX) {
-		VRB_WARN(FI_LOG_CORE,
-			 "Invalid PCI address format: '%s' "
-			 "(expected xxxx:xx:xx.x with valid ranges)\n",
-			 pci_str);
+	if (!pci_str || !*pci_str ||
+	    strspn(pci_str, "0123456789abcdefABCDEF:.") != strlen(pci_str))
 		return -FI_EINVAL;
+
+	/* Field widths bound each component and prevent overflow */
+	if (sscanf(pci_str, "%8x:%2x:%2x.%1x%n", &domain, &bus, &device,
+		   &function, &len) != VRB_PCI_ADDR_COMPONENTS || pci_str[len]) {
+		domain = 0;
+		len = 0;
+		if (sscanf(pci_str, "%2x:%2x.%1x%n", &bus, &device, &function,
+			   &len) != VRB_PCI_ADDR_COMPONENTS - 1 || pci_str[len])
+			return -FI_EINVAL;
 	}
+
+	if (domain > VRB_PCI_DOMAIN_MAX || bus > VRB_PCI_BUS_MAX ||
+	    device > VRB_PCI_DEVICE_MAX || function > VRB_PCI_FUNCTION_MAX)
+		return -FI_EINVAL;
 
 	pci_attr->domain_id = (uint16_t)domain;
 	pci_attr->bus_id = (uint8_t)bus;
@@ -2152,6 +2164,8 @@ static const char *vrb_proximity_str(enum vrb_pcie_proximity proximity)
 	switch (proximity) {
 	case VRB_PROXIMITY_BRIDGE:
 		return "bridge";
+	case VRB_PROXIMITY_HOSTBRIDGE:
+		return "hostbridge";
 	case VRB_PROXIMITY_PACKAGE:
 		return "package";
 	case VRB_PROXIMITY_MACHINE:
@@ -2229,41 +2243,65 @@ static void vrb_log_nic_order(const struct fi_info *info,
 static int vrb_parse_manual_affinity_config(const struct fi_pci_attr *device_pci,
 					    char *nic_name, size_t nic_name_len)
 {
+	const char *path = vrb_gl_data.nic_affinity_config;
 	FILE *fp;
 	char line[VRB_MAX_CONFIG_LINE_LEN];
 	char pci_str[VRB_MAX_CONFIG_LINE_LEN];
 	char nic[VRB_MAX_CONFIG_LINE_LEN];
 	struct fi_pci_attr pci_attr;
+	char extra;
+	char *p;
+	size_t len;
+	int line_no = 0;
+	int c;
 	int ret;
 
-	if (NULL == vrb_gl_data.nic_affinity_config) {
+	if (NULL == path) {
 		VRB_WARN(FI_LOG_CORE, "FI_VERBS_NIC_AFFINITY_CONFIG not set\n");
 		return -FI_ENODATA;
 	}
 
-	fp = fopen(vrb_gl_data.nic_affinity_config, "r");
+	fp = fopen(path, "r");
 	if (!fp) {
-		VRB_WARN(FI_LOG_CORE, "Failed to open config file: %s\n",
-			 vrb_gl_data.nic_affinity_config);
+		VRB_WARN(FI_LOG_CORE, "Failed to open config file %s: %s\n",
+			 path, strerror(errno));
 		return -FI_ENOENT;
 	}
 
 	while (fgets(line, sizeof(line), fp)) {
-		/* Skip comments and empty lines */
-		if (line[0] == '#' || line[0] == '\n') continue;
+		line_no++;
+		len = strlen(line);
+		if (len && line[len - 1] == '\n') {
+			line[--len] = '\0';
+		} else if (!feof(fp)) {
+			/* No newline and not at EOF: the line did not fit */
+			VRB_WARN(FI_LOG_CORE, "%s:%d: line longer than %d "
+				 "characters, skipping\n", path, line_no,
+				 VRB_MAX_CONFIG_LINE_LEN - 2);
+			while ((c = fgetc(fp)) != EOF && c != '\n')
+				;
+			continue;
+		}
 
-		ret = sscanf(line, "%s %s", pci_str, nic);
-		if (ret != 2) {
-			VRB_WARN(FI_LOG_CORE, "Malformed config line (expected "
-				 "'<pci_address> <nic_name>'): %s", line);
+		/* Skip empty lines and comments, including indented ones */
+		p = line + strspn(line, " \t\r");
+		if (*p == '\0' || *p == '#')
+			continue;
+
+		/* Two fields, optionally followed by a '#' comment */
+		ret = sscanf(p, "%s %s %c", pci_str, nic, &extra);
+		if (ret < 2 || nic[0] == '#' || (ret == 3 && extra != '#')) {
+			VRB_WARN(FI_LOG_CORE, "%s:%d: malformed line (expected "
+				 "'<pci_address> <nic_name>'), skipping: %s\n",
+				 path, line_no, line);
 			continue;
 		}
 
 		ret = vrb_parse_pci_address(pci_str, &pci_attr);
 		if (ret) {
-			VRB_WARN(FI_LOG_CORE, "Invalid PCI address format '%s' "
-				 "(expected xxxx:xx:xx.x), skipping line: %s",
-				 pci_str, line);
+			VRB_WARN(FI_LOG_CORE, "%s:%d: invalid PCI address '%s' "
+				 "(expected [dddd:]bb:dd.f), skipping\n",
+				 path, line_no, pci_str);
 			continue;
 		}
 
@@ -2286,6 +2324,94 @@ static int vrb_parse_manual_affinity_config(const struct fi_pci_attr *device_pci
 }
 
 #ifdef HAVE_HWLOC
+/*
+ * Topology for the auto policy. It is loaded at init by
+ * vrb_nic_affinity_topo_init() and replaced on FI_RESCAN by
+ * vrb_nic_affinity_topo_reload(), so hot-plugged NICs are found. Readers
+ * hold the read lock while using it (hwloc allows concurrent read-only
+ * access); replacing it takes the write lock.
+ */
+static hwloc_topology_t vrb_topology;
+static pthread_rwlock_t vrb_topology_lock = PTHREAD_RWLOCK_INITIALIZER;
+
+static int vrb_topology_load(hwloc_topology_t *out)
+{
+	hwloc_topology_t topology;
+
+	if (hwloc_topology_init(&topology)) {
+		VRB_WARN(FI_LOG_CORE, "hwloc_topology_init failed\n");
+		return -FI_EOTHER;
+	}
+
+	if (hwloc_topology_set_io_types_filter(topology,
+					       HWLOC_TYPE_FILTER_KEEP_ALL)) {
+		VRB_WARN(FI_LOG_CORE, "hwloc_topology_set_io_types_filter failed\n");
+		goto err;
+	}
+
+	if (hwloc_topology_load(topology)) {
+		VRB_WARN(FI_LOG_CORE, "hwloc_topology_load failed\n");
+		goto err;
+	}
+
+	*out = topology;
+	return FI_SUCCESS;
+err:
+	hwloc_topology_destroy(topology);
+	return -FI_EOTHER;
+}
+
+/* Load a fresh topology and make it current. Loading is slow, so it is
+ * done without the lock held; only the pointer swap takes the write lock,
+ * which waits for readers of the old topology to finish. */
+static int vrb_topology_replace(void)
+{
+	hwloc_topology_t topology;
+	hwloc_topology_t old;
+	int ret;
+
+	ret = vrb_topology_load(&topology);
+	if (ret)
+		return ret;
+
+	pthread_rwlock_wrlock(&vrb_topology_lock);
+	old = vrb_topology;
+	vrb_topology = topology;
+	pthread_rwlock_unlock(&vrb_topology_lock);
+
+	if (old)
+		hwloc_topology_destroy(old);
+	return FI_SUCCESS;
+}
+
+/* Called from provider init, before any reader exists */
+int vrb_nic_affinity_topo_init(void)
+{
+	if (vrb_topology)
+		return FI_SUCCESS;
+	return vrb_topology_replace();
+}
+
+/* Called on FI_RESCAN so NICs added since the last load are found */
+void vrb_nic_affinity_topo_reload(void)
+{
+	if (vrb_topology_replace())
+		VRB_WARN(FI_LOG_CORE, "Failed to reload hwloc topology on "
+			 "FI_RESCAN; keeping the previous one\n");
+	else
+		VRB_INFO(FI_LOG_CORE, "Reloaded hwloc topology on FI_RESCAN\n");
+}
+
+void vrb_nic_affinity_topo_fini(void)
+{
+	pthread_rwlock_wrlock(&vrb_topology_lock);
+	if (vrb_topology) {
+		hwloc_topology_destroy(vrb_topology);
+		vrb_topology = NULL;
+	}
+	pthread_rwlock_unlock(&vrb_topology_lock);
+}
+
 static hwloc_obj_t vrb_find_pci_device(hwloc_topology_t topology,
 	const struct fi_pci_attr *pci)
 {
@@ -2310,21 +2436,36 @@ vrb_calc_pcie_proximity(hwloc_topology_t topology,
 {
 	hwloc_obj_t a, b;
 
-        if (!dev1 || !dev2)
-                return VRB_PROXIMITY_UNKNOWN;
+	if (!dev1 || !dev2)
+		return VRB_PROXIMITY_UNKNOWN;
 
-        for (a = dev1->parent; a; a = a->parent) {
-                for (b = dev2->parent; b; b = b->parent) {
-                        if (a != b)
-                                continue;
-                        if (a->type == HWLOC_OBJ_BRIDGE)
-                                return VRB_PROXIMITY_BRIDGE;
-                        if (a->type == HWLOC_OBJ_PACKAGE)
-                                return VRB_PROXIMITY_PACKAGE;
-                        return VRB_PROXIMITY_MACHINE;
-                }
-        }
-        return VRB_PROXIMITY_UNKNOWN;
+	/* Find the lowest common ancestor of the two devices */
+	for (a = dev1->parent; a; a = a->parent) {
+		for (b = dev2->parent; b && b != a; b = b->parent)
+			;
+		if (b)
+			break;
+	}
+	if (!a)
+		return VRB_PROXIMITY_UNKNOWN;
+
+	/* Meeting in the I/O tree. Paths that join only at the host bridge
+	 * share the root complex but go through different root ports, which
+	 * is farther than sharing a PCIe switch. */
+	if (a->type == HWLOC_OBJ_BRIDGE)
+		return a->attr->bridge.upstream_type == HWLOC_OBJ_BRIDGE_HOST ?
+		       VRB_PROXIMITY_HOSTBRIDGE : VRB_PROXIMITY_BRIDGE;
+
+	/* hwloc attaches host bridges to the closest CPU-side object, which
+	 * may be a Group, Die, L3 or NUMA node inside the package rather than
+	 * the package itself. Any common ancestor at or below a package means
+	 * the devices share a socket. */
+	for (; a; a = a->parent) {
+		if (a->type == HWLOC_OBJ_PACKAGE)
+			return VRB_PROXIMITY_PACKAGE;
+	}
+
+	return VRB_PROXIMITY_MACHINE;
 }
 
 static int vrb_pci_addr_compare(const struct fi_pci_attr *a,
@@ -2371,31 +2512,42 @@ static int vrb_proximity_compare(const void *a, const void *b)
 }
 #endif /* HAVE_HWLOC */
 
-int vrb_nic_affinity_manual(struct fi_info **info, const struct fi_pci_attr *device_pci)
+/* NIC mapped to the affinity device, read once from the config file */
+static char vrb_manual_target_nic[VRB_MAX_CONFIG_LINE_LEN];
+
+int vrb_nic_affinity_manual_init(const struct fi_pci_attr *device_pci)
 {
-	char target_nic[VRB_MAX_CONFIG_LINE_LEN];
-	char pci_str[VRB_PCI_STR_LEN];
-	struct fi_info *cur;
-	struct fi_info *prev;
-	struct fi_info *next;
-	struct fi_info *target_head;
-	struct fi_info *target_tail;
 	int ret;
 
-	target_head = NULL;
-	target_tail = NULL;
-
-	ret = vrb_parse_manual_affinity_config(device_pci, target_nic,
-		sizeof(target_nic));
+	ret = vrb_parse_manual_affinity_config(device_pci, vrb_manual_target_nic,
+					       sizeof(vrb_manual_target_nic));
 	if (ret) {
+		vrb_manual_target_nic[0] = '\0';
 		/* The specific cause was logged by the config parser */
 		VRB_INFO(FI_LOG_CORE, "Manual policy: no usable mapping for "
 			 "device %04x:%02x:%02x.%x: %s (%d); skipping reordering\n",
 			 device_pci->domain_id, device_pci->bus_id,
 			 device_pci->device_id, device_pci->function_id,
 			 fi_strerror(-ret), ret);
-		return FI_SUCCESS;
 	}
+	return ret;
+}
+
+int vrb_nic_affinity_manual(struct fi_info **info, const struct fi_pci_attr *device_pci)
+{
+	const char *target_nic = vrb_manual_target_nic;
+	char pci_str[VRB_PCI_STR_LEN];
+	struct fi_info *cur;
+	struct fi_info *prev;
+	struct fi_info *next;
+	struct fi_info *target_head;
+	struct fi_info *target_tail;
+
+	target_head = NULL;
+	target_tail = NULL;
+
+	if (!target_nic[0])
+		return FI_SUCCESS;
 
 	VRB_DBG(FI_LOG_CORE, "Manual policy: device %04x:%02x:%02x.%x -> NIC %s\n",
 		device_pci->domain_id, device_pci->bus_id,
@@ -2454,40 +2606,30 @@ int vrb_nic_affinity_auto(struct fi_info **info, const struct fi_pci_attr *devic
 	char pci_str[VRB_PCI_STR_LEN];
 	int entries_count;
 	int i;
-	int ret;
 
 	entries_count = 0;
-
-	topology = NULL;
-	gpu_obj = NULL;
-	nic_array = NULL;
 
 	for (cur = *info; cur; cur = cur->next)
 		entries_count++;
 	if (entries_count == 0)
 		return FI_SUCCESS;
 
-	ret = hwloc_topology_init(&topology);
-	if (ret) {
-		VRB_WARN(FI_LOG_CORE, "hwloc_topology_init failed, "
-			 "falling back to none policy\n");
+	/* Allocate array for NIC info with proximity data */
+	nic_array = calloc(entries_count, sizeof(*nic_array));
+	if (!nic_array) {
+		VRB_WARN(FI_LOG_CORE, "Failed to allocate NIC array, "
+			 "list unchanged\n");
 		return FI_SUCCESS;
 	}
 
-	ret = hwloc_topology_set_io_types_filter(topology, HWLOC_TYPE_FILTER_KEEP_ALL);
-	if (ret) {
-		VRB_WARN(FI_LOG_CORE, "hwloc_topology_set_io_types_filter failed, "
-			 "falling back to none policy\n");
-		hwloc_topology_destroy(topology);
-		return FI_SUCCESS;
-	}
-
-	ret = hwloc_topology_load(topology);
-	if (ret) {
-		VRB_WARN(FI_LOG_CORE, "hwloc_topology_load failed, "
-			 "falling back to none policy\n");
-		hwloc_topology_destroy(topology);
-		return FI_SUCCESS;
+	/* Hold the read lock while using the topology, so FI_RESCAN in
+	 * another thread cannot free it underneath us */
+	pthread_rwlock_rdlock(&vrb_topology_lock);
+	topology = vrb_topology;
+	if (!topology) {
+		VRB_WARN(FI_LOG_CORE, "hwloc topology not available; "
+			 "skipping reordering\n");
+		goto skip;
 	}
 
 	gpu_obj = vrb_find_pci_device(topology, device_pci);
@@ -2496,17 +2638,7 @@ int vrb_nic_affinity_auto(struct fi_info **info, const struct fi_pci_attr *devic
 			 "topology; skipping reordering\n", device_pci->domain_id,
 			 device_pci->bus_id, device_pci->device_id,
 			 device_pci->function_id);
-		hwloc_topology_destroy(topology);
-		return FI_SUCCESS;
-	}
-
-	/* Allocate array for NIC info with proximity data */
-	nic_array = calloc(entries_count, sizeof(*nic_array));
-	if (!nic_array) {
-		VRB_WARN(FI_LOG_CORE, "Failed to allocate NIC array, "
-			 "list unchanged\n");
-		hwloc_topology_destroy(topology);
-		return FI_SUCCESS;
+		goto skip;
 	}
 
 	/* Calculate proximity for each NIC */
@@ -2535,6 +2667,7 @@ int vrb_nic_affinity_auto(struct fi_info **info, const struct fi_pci_attr *devic
 
 		nic_array[i].proximity = vrb_calc_pcie_proximity(topology, gpu_obj, nic_pci_obj);
 	}
+	pthread_rwlock_unlock(&vrb_topology_lock);
 
 	/* Sort NICs by proximity (best first) */
 	qsort(nic_array, entries_count, sizeof(*nic_array), vrb_proximity_compare);
@@ -2560,8 +2693,12 @@ int vrb_nic_affinity_auto(struct fi_info **info, const struct fi_pci_attr *devic
 	vrb_log_nic_order(*info, nic_array);
 
 	free(nic_array);
-	hwloc_topology_destroy(topology);
 
+	return FI_SUCCESS;
+
+skip:
+	pthread_rwlock_unlock(&vrb_topology_lock);
+	free(nic_array);
 	return FI_SUCCESS;
 }
 #endif /* HAVE_HWLOC */
@@ -2573,7 +2710,6 @@ int vrb_getinfo(uint32_t version, const char *node, const char *service,
 	static bool init_done = false;
 	struct dlist_entry tmp_devs;
 	struct fi_info *tmp_info = NULL;
-	struct fi_pci_attr device_pci;
 	int ret;
 
 	vrb_prof_func_start(__func__);
@@ -2605,6 +2741,12 @@ int vrb_getinfo(uint32_t version, const char *node, const char *service,
 			fi_freeinfo(tmp_info);
 			goto out;
 		}
+#ifdef HAVE_HWLOC
+		/* Rescan may find NICs hot-plugged after the topology was
+		 * loaded; reload it so they get a real proximity */
+		if (vrb_gl_data.nic_affinity_handler == vrb_nic_affinity_auto)
+			vrb_nic_affinity_topo_reload();
+#endif
 	}
 
 	ofi_mutex_lock(&vrb_info_mutex);
@@ -2630,21 +2772,16 @@ int vrb_getinfo(uint32_t version, const char *node, const char *service,
 	if (hints)
 		vrb_filter_info_by_addr_format(info, hints->addr_format);
 
-	/* Apply NIC affinity reordering policy */
-	if (*info && vrb_gl_data.nic_affinity_handler && vrb_gl_data.affinity_device) {
-		ret = vrb_parse_pci_address(vrb_gl_data.affinity_device, &device_pci);
+	/* Apply NIC affinity reordering policy. The handler is only set when
+	 * FI_VERBS_AFFINITY_DEVICE was valid at init (vrb_nic_affinity_init) */
+	if (*info && vrb_gl_data.nic_affinity_handler) {
+		ret = vrb_gl_data.nic_affinity_handler(info,
+				&vrb_gl_data.affinity_device_pci);
 		if (ret) {
 			VRB_WARN(FI_LOG_CORE,
-				 "Failed to parse FI_VERBS_AFFINITY_DEVICE, list unchanged\n");
+				 "NIC affinity handler failed: %s (%d)\n",
+				 fi_strerror(-ret), ret);
 			ret = 0;
-		} else {
-			ret = vrb_gl_data.nic_affinity_handler(info, &device_pci);
-			if (ret) {
-				VRB_WARN(FI_LOG_CORE,
-					 "NIC affinity handler failed: %s (%d)\n",
-					 fi_strerror(-ret), ret);
-				ret = 0;
-			}
 		}
 	}
 out:

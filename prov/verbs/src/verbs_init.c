@@ -843,10 +843,47 @@ static int vrb_nic_affinity_init(void)
 			 vrb_gl_data.nic_affinity_policy);
 	}
 
-	if (vrb_gl_data.nic_affinity_handler && !vrb_gl_data.affinity_device)
-		VRB_WARN(FI_LOG_CORE, "NIC affinity policy '%s' requested but no "
-			 "GPU device provided (FI_VERBS_AFFINITY_DEVICE not set); "
-			 "skipping reordering\n", vrb_gl_data.nic_affinity_policy);
+	if (!vrb_gl_data.affinity_device) {
+		if (vrb_gl_data.nic_affinity_handler)
+			VRB_WARN(FI_LOG_CORE, "NIC affinity policy '%s' requested "
+				 "but no GPU device provided (FI_VERBS_AFFINITY_DEVICE "
+				 "not set); skipping reordering\n",
+				 vrb_gl_data.nic_affinity_policy);
+		vrb_gl_data.nic_affinity_handler = NULL;
+		return FI_SUCCESS;
+	}
+
+	if (!vrb_gl_data.nic_affinity_handler) {
+		VRB_WARN(FI_LOG_CORE, "FI_VERBS_AFFINITY_DEVICE=%s ignored: no NIC "
+			 "affinity policy active (set FI_VERBS_NIC_AFFINITY_POLICY "
+			 "to 'auto' or 'manual')\n", vrb_gl_data.affinity_device);
+		return FI_SUCCESS;
+	}
+
+	/* Parse the device once here instead of on every fi_getinfo() call */
+	if (vrb_parse_pci_address(vrb_gl_data.affinity_device,
+				  &vrb_gl_data.affinity_device_pci)) {
+		VRB_WARN(FI_LOG_CORE, "Invalid FI_VERBS_AFFINITY_DEVICE '%s' "
+			 "(expected [dddd:]bb:dd.f); skipping reordering\n",
+			 vrb_gl_data.affinity_device);
+		vrb_gl_data.nic_affinity_handler = NULL;
+		return FI_SUCCESS;
+	}
+
+	/* The device is fixed, so its manual mapping is read only once */
+	if (vrb_gl_data.nic_affinity_handler == vrb_nic_affinity_manual &&
+	    vrb_nic_affinity_manual_init(&vrb_gl_data.affinity_device_pci))
+		vrb_gl_data.nic_affinity_handler = NULL;
+
+#ifdef HAVE_HWLOC
+	/* Load the topology once instead of on every fi_getinfo() call */
+	if (vrb_gl_data.nic_affinity_handler == vrb_nic_affinity_auto &&
+	    vrb_nic_affinity_topo_init()) {
+		VRB_WARN(FI_LOG_CORE, "Failed to load hwloc topology for NIC "
+			 "affinity policy 'auto', falling back to 'none'\n");
+		vrb_gl_data.nic_affinity_handler = NULL;
+	}
+#endif
 
 	return FI_SUCCESS;
 }
@@ -893,6 +930,9 @@ static void vrb_fini(void)
 	fi_freeinfo(vrb_util_prov.info);
 	vrb_os_fini();
 	vrb_util_prov.info = NULL;
+#ifdef HAVE_HWLOC
+	vrb_nic_affinity_topo_fini();
+#endif
 }
 
 VERBS_INI

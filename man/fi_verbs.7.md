@@ -234,17 +234,27 @@ The verbs provider checks for the following environment variables.
   options are "manual", "auto" or "none". When set to "manual", NIC affinity
   mapping is specified in a configuration file (see FI_VERBS_NIC_AFFINITY_CONFIG).
   When set to "auto" NIC affinity mapping is determined automatically based on
-  the information provided by `hwloc`. In either case, the mapping key is
-  supplied via FI_VERBS_AFFINITY_DEVICE. (default: none)
+  the information provided by `hwloc`: NICs behind the same PCIe switch as the
+  device come first, then NICs on the same root complex, then NICs on the same
+  CPU socket, then all others. NICs at the same distance are ordered by PCI
+  address. The topology is read when the provider is initialized and again on
+  each fi_getinfo() call with FI_RESCAN, so NICs added later are ranked after
+  a rescan. In either case, the mapping key is supplied via
+  FI_VERBS_AFFINITY_DEVICE. (default: none)
 
 *FI_VERBS_AFFINITY_DEVICE*
-: PCI address of device for NIC affinity.
+: PCI address of device for NIC affinity, in the form "dddd:bb:dd.f" or
+  "bb:dd.f" (domain 0). Ignored unless FI_VERBS_NIC_AFFINITY_POLICY is "auto"
+  or "manual".
 
 *FI_VERBS_NIC_AFFINITY_CONFIG*
-: Path to NIC affinity configuration file for the "manual" policy. The
-  configuration file can have any number of lines. Each line consists of a
-  PCIe address followed by a NIC name, seperated by a single space. Empty
-  lines and lines starting with "#" are ignored.
+: Path to NIC affinity configuration file for the "manual" policy. The file
+  is read once, when the provider is initialized. It can have any number of
+  lines. Each line consists of a PCI address (same format as
+  FI_VERBS_AFFINITY_DEVICE) followed by a NIC name, separated by whitespace,
+  optionally followed by a "#" comment. Empty lines and lines starting with
+  "#" (after optional whitespace) are ignored. Lines longer than 254
+  characters are skipped.
 
 *FI_VERBS_USE_FLOW_CTRL*
 : Enable credit based flow control. Requires RxM to work. (default: yes)

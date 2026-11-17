@@ -218,6 +218,7 @@ extern struct vrb_gl_data {
 	vrb_nic_affinity_handler_t	nic_affinity_handler;
 	char	*nic_affinity_policy;
 	char	*affinity_device;
+	struct fi_pci_attr affinity_device_pci;	/* parsed affinity_device */
 	char	*nic_affinity_config;
 
 	int	use_flow_ctrl;
@@ -1145,9 +1146,14 @@ void vrb_prof_init();
 int vrb_prof_create(vrb_profile_t **prof);
 
 /* NIC affinity policy handlers */
+int vrb_parse_pci_address(const char *pci_str, struct fi_pci_attr *pci_attr);
+int vrb_nic_affinity_manual_init(const struct fi_pci_attr *device_pci);
 int vrb_nic_affinity_manual(struct fi_info **info, const struct fi_pci_attr *device_pci);
 #ifdef HAVE_HWLOC
 int vrb_nic_affinity_auto(struct fi_info **info, const struct fi_pci_attr *device_pci);
+int vrb_nic_affinity_topo_init(void);
+void vrb_nic_affinity_topo_reload(void);
+void vrb_nic_affinity_topo_fini(void);
 #endif
 
 #endif /* VERBS_OFI_H */
